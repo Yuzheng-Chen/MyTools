@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YouTube 链接 → RSS</title>
+    <!-- TailwindCSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-slate-950 text-slate-100">
+    <div id="root"></div>
+
+    <!-- React + ReactDOM CDN -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+    <!-- App Script -->
+    <script type="text/javascript">
+      const { useState, useMemo } = React;
+
+      function App() {
+        const [input, setInput] = useState("");
+        const [invBase, setInvBase] = useState("https://yewtu.be");
+        const [loading, setLoading] = useState(false);
+        const [error, setError] = useState("");
+        const [result, setResult] = useState(null);
+        const [copied, setCopied] = useState(false);
+
+        const prettyInvBase = useMemo(
+          () => invBase.replace(/\/$/, ""),
+          [invBase]
+        );
+
+        function toast() {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1600);
+        }
+
+        function toLinks(channelId) {
+          return {
+            officialRss: `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`,
+            invidiousRss: `${prettyInvBase}/feed/channel/${channelId}`,
+          };
+        }
+
+        // --- 输入解析 ---
+        function parseInput(raw) {
+          const s = raw.trim();
+          if (!s) return { kind: "unknown" };
+          if (/^UC[\w-]{22}$/.test(s)) return { kind: "channel", id: s };
+          if (/^@\w[\w.-]*$/.test(s))
+            return { kind: "handle", handle: s.replace(/^@/, "") };
+
+          let url = null;
+          try {
+            url = new URL(s.match(/^https?:\/\//) ? s : `https://${s}`);
+          } catch {
+            return { kind: "unknown" };
+          }
+
+          const host = url.hostname.toLowerCase();
+          const parts = url.pathname.split("/").filter(Boolean);
+          const q = url.searchParams;
+
+          if (host.includes("youtu.be")) {
+            if (parts[0]) return { kind: "video", id: parts[0] };
+          }
+
+          if (
+            host.includes("youtube.com") ||
+            /invidious|yewtu|piped/.test(host)
+          ) {
+            if (parts[0] === "channel" && /^UC[\w-]{22}$/.test(parts[1] || ""))
+              return { kind: "channel", id: parts[1] };
+            if (parts[0] === "watch" && q.get("v"))
+              return { kind: "video", id: q.get("v") };
+            if (parts[0] === "shorts" && parts[1])
+              return { kind: "video", id: parts[1] };
+            if (parts[0]?.startsWith("@"))
+              return { kind: "handle", handle: parts[0].slice(1) };
+            if (parts[0] === "user" && parts[1])
+              return { kind: "user", name: parts[1] };
+            if (parts[0] === "c" && parts[1])
+              return { kind: "custom", name: parts[1] };
+          }
+          return { kind: "unknown" };
+        }
+
+        async function fetchJson(url, timeoutMs = 12000) {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const res = await fetch(url, { signal: controller.signal });
+            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+            return await res.json();
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+
+        async function resolveChannelId(parsed) {
+          if (parsed.kind === "channel")
+            return { channelId: parsed.id, source: "channel" };
+          if (parsed.kind === "video") {
+            try {
+              const api = `${prettyInvBase}/api/v1/videos/${encodeURIComponent(
+                parsed.id
+              )}`;
+              const json = await fetchJson(api);
+              const cid = json?.authorId || json?.ucid || null;
+              if (cid && /^UC[\w-]{22}$/.test(cid))
+                return { channelId: cid, source: "video" };
+            } catch {}
+          }
+          if (["handle", "user", "custom"].includes(parsed.kind)) {
+            const query =
+              parsed.kind === "handle" ? `@${parsed.handle}` : parsed.name;
+            try {
+              const api = `${prettyInvBase}/api/v1/search?q=${encodeURIComponent(
+                query
+              )}&type=channel`;
+              const json = await fetchJson(api);
+              if (Array.isArray(json) && json.length) {
+                const found =
+                  json.find(
+                    (x) => x.authorId && /^UC[\w-]{22}$/.test(x.authorId)
+                  ) || json[0];
+                const cid = found?.authorId || found?.ucid || null;
+                if (cid && /^UC[\w-]{22}$/.test(cid))
+                  return { channelId: cid, source: parsed.kind };
+              }
+            } catch {}
+          }
+          return { channelId: null, source: parsed.kind };
+        }
+
+        async function onConvert() {
+          setError("");
+          setResult(null);
+          setCopied(false);
+
+          const parsed = parseInput(input);
+          if (parsed.kind === "unknown") {
+            setError(
+              "无法识别输入，请粘贴 Youtube 频道链接，或 Channel ID。详见使用说明👇"
+            );
+            return;
+          }
+
+          setLoading(true);
+          try {
+            const { channelId, source } = await resolveChannelId(parsed);
+            if (!channelId) {
+              setError(`解析失败（类型：${source}），请检查输入是否正确`);
+              return;
+            }
+            const links = toLinks(channelId);
+            setResult({ channelId, sourceType: source, ...links });
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        function copy(text) {
+          navigator.clipboard.writeText(text).then(() => toast());
+        }
+
+        return React.createElement(
+          "div",
+          { className: "max-w-2xl mx-auto p-6" },
+          React.createElement(
+            "h1",
+            { className: "text-3xl font-semibold text-center mb-6" },
+            "YouTube 链接 → RSS"
+          ),
+          React.createElement(
+            "div",
+            { className: "bg-slate-900 rounded-xl p-6 shadow-lg" },
+            React.createElement("input", {
+              className:
+                "w-full rounded-xl bg-slate-800 border border-slate-700 px-4 py-3 mb-3 focus:ring-2 focus:ring-indigo-500",
+              placeholder: "请输入 YouTube 频道链接，或 Channel ID",
+              value: input,
+              onChange: (e) => setInput(e.target.value),
+              onKeyDown: (e) => e.key === "Enter" && onConvert(),
+            }),
+            React.createElement(
+              "div",
+              { className: "flex gap-2 mb-3" },
+              React.createElement(
+                "button",
+                {
+                  className:
+                    "flex-1 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500",
+                  onClick: onConvert,
+                  disabled: loading,
+                },
+                loading ? "解析中…" : "转换"
+              )
+            ),
+            error &&
+              React.createElement(
+                "div",
+                { className: "text-red-400 text-sm" },
+                error
+              ),
+            result &&
+              React.createElement(
+                "div",
+                { className: "mt-4 space-y-3" },
+                React.createElement(
+                  "div",
+                  { className: "text-sm" },
+                  "ChannelId: ",
+                  React.createElement(
+                    "span",
+                    { className: "font-mono" },
+                    result.channelId
+                  )
+                ),
+                React.createElement(
+                  "div",
+                  null,
+                  React.createElement(
+                    "div",
+                    { className: "text-xs text-slate-400" },
+                    "官方 RSS"
+                  ),
+                  React.createElement(
+                    "div",
+                    { className: "font-mono break-all" },
+                    result.officialRss
+                  ),
+                  React.createElement(
+                    "div",
+                    { className: "flex gap-2 mt-1" },
+                    React.createElement(
+                      "button",
+                      {
+                        className: "px-3 py-1 bg-slate-700 rounded",
+                        onClick: () => copy(result.officialRss),
+                      },
+                      "复制"
+                    ),
+                    React.createElement(
+                      "a",
+                      {
+                        className: "px-3 py-1 bg-slate-700 rounded",
+                        href: result.officialRss,
+                        target: "_blank",
+                      },
+                      "打开"
+                    )
+                  )
+                ),
+                React.createElement(
+                  "div",
+                  null,
+                  React.createElement(
+                    "div",
+                    { className: "text-xs text-slate-400" },
+                    "Invidious RSS"
+                  ),
+                  React.createElement(
+                    "div",
+                    { className: "font-mono break-all" },
+                    result.invidiousRss
+                  ),
+                  React.createElement(
+                    "div",
+                    { className: "flex gap-2 mt-1" },
+                    React.createElement(
+                      "button",
+                      {
+                        className: "px-3 py-1 bg-slate-700 rounded",
+                        onClick: () => copy(result.invidiousRss),
+                      },
+                      "复制"
+                    ),
+                    React.createElement(
+                      "a",
+                      {
+                        className: "px-3 py-1 bg-slate-700 rounded",
+                        href: result.invidiousRss,
+                        target: "_blank",
+                      },
+                      "打开"
+                    )
+                  )
+                )
+              )
+          ),
+          copied &&
+            React.createElement(
+              "div",
+              {
+                className:
+                  "fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-800 px-4 py-2 rounded-xl",
+              },
+              "已复制"
+            )
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(
+        React.createElement(App)
+      );
+    </script>
+    <!-- 说明区块 -->
+    <section class="max-w-2xl mx-auto mt-12 px-6">
+      <div class="rounded-2xl border border-slate-800 bg-slate-900/70 p-6">
+        <h2 class="text-lg font-semibold mb-3">使用说明</h2>
+        <p class="text-sm text-slate-300 leading-relaxed mb-2">
+          输入示例：<br />
+          <code class="font-mono text-indigo-300"
+            >https://www.youtube.com/channel/UCSt_ZRe_mla4tRgYC_GNElQ/videos</code
+          ><br />
+          或直接输入
+          <code class="font-mono text-indigo-300"
+            >UCSt_ZRe_mla4tRgYC_GNElQ</code
+          >
+        </p>
+        <p class="text-sm text-slate-400 leading-relaxed mb-4">
+          如何获取 Channel ID：进入频道主页，点击右上角的
+          <code
+            class="px-1 py-0.5 rounded bg-slate-800 text-slate-200 font-mono text-sm"
+            >…more</code
+          >
+          →
+          <code
+            class="px-1 py-0.5 rounded bg-slate-800 text-slate-200 font-mono text-sm"
+            >Share channel</code
+          >
+          →
+          <code
+            class="px-1 py-0.5 rounded bg-slate-800 text-slate-200 font-mono text-sm"
+            >Copy channel ID</code
+          >。
+        </p>
+        <div class="rounded-xl overflow-hidden border border-slate-700">
+          <!-- 在此替换为你的图片文件名 -->
+          <img
+            src="channel-id.png"
+            alt="获取 Channel ID 的操作示意"
+            class="w-full"
+          />
+        </div>
+      </div>
+    </section>
+  </body>
+</html>
